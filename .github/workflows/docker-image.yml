@@ -1,0 +1,318 @@
+name: Deploy WordPress to AWS ECS
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY_NAME: wordpress-repository
+  ECS_CLUSTER_NAME: wordpress-cluster
+  ECS_SERVICE_NAME: wordpress-service
+  CONTAINER_NAME: wordpress
+  IMAGE_TAG: latest
+  DB_INSTANCE_IDENTIFIER: wordpress-db
+  DB_USERNAME: wordpressuser
+  DB_PASSWORD: wordpresspassword
+  DB_NAME: wordpressdb
+
+jobs:
+  deploy:
+    name: Deploy WordPress to AWS ECS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build Docker image
+        run: |
+          docker build -t $ECR_REPOSITORY_NAME:$IMAGE_TAG .
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Create ECR repository if it doesn't exist
+        run: |
+          aws ecr describe-repositories --repository-names $ECR_REPOSITORY_NAME || \
+          aws ecr create-repository --repository-name $ECR_REPOSITORY_NAME
+
+      - name: Tag and push Docker image to ECR
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY_NAME
+          docker tag $ECR_REPOSITORY_NAME:$IMAGE_TAG $ECR_URI:$IMAGE_TAG
+          docker push $ECR_URI:$IMAGE_TAG
+          echo "ECR_URI=$ECR_URI" >> $GITHUB_ENV
+
+      - name: Create ECS cluster if not exists
+        run: |
+          CLUSTER_STATUS=$(aws ecs describe-clusters --clusters $ECS_CLUSTER_NAME --query 'clusters[0].status' --output text || echo "MISSING")
+          if [ "$CLUSTER_STATUS" != "ACTIVE" ]; then
+            aws ecs create-cluster --cluster-name $ECS_CLUSTER_NAME
+          fi
+          echo "ECS_CLUSTER_NAME is $ECS_CLUSTER_NAME"
+
+      - name: Create VPC and subnets if not exists
+        id: create_vpc_subnets
+        run: |
+          set -e
+          set -x
+          # Get or create the VPC
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=wordpress-vpc" --query 'Vpcs[0].VpcId' --output text || echo "")
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" == "None" ]; then
+            VPC_ID=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 --query 'Vpc.VpcId' --output text)
+            aws ec2 create-tags --resources $VPC_ID --tags Key=Name,Value=wordpress-vpc
+            aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-support
+            aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames
+          fi
+
+          echo "VPC_ID is $VPC_ID"
+          echo "VPC_ID=$VPC_ID" >> $GITHUB_ENV
+
+          # Get or create public subnet 1
+          SUBNET_PUBLIC_1=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" "Name=cidr-block,Values=10.0.1.0/24" --query 'Subnets[0].SubnetId' --output text || echo "")
+          if [ -z "$SUBNET_PUBLIC_1" ] || [ "$SUBNET_PUBLIC_1" == "None" ]; then
+            SUBNET_PUBLIC_1=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 --availability-zone ${AWS_REGION}a --query 'Subnet.SubnetId' --output text)
+            aws ec2 create-tags --resources $SUBNET_PUBLIC_1 --tags Key=Name,Value=wordpress-public-subnet-1
+          fi
+
+          # Get or create public subnet 1
+          SUBNET_PUBLIC_2=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" "Name=cidr-block,Values=10.0.2.0/24" --query 'Subnets[0].SubnetId' --output text || echo "")
+          if [ -z "$SUBNET_PUBLIC_2" ] || [ "$SUBNET_PUBLIC_2" == "None" ]; then
+            SUBNET_PUBLIC_2=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.2.0/24 --availability-zone ${AWS_REGION}b --query 'Subnet.SubnetId' --output text)
+            aws ec2 create-tags --resources $SUBNET_PUBLIC_2 --tags Key=Name,Value=wordpress-public-subnet-2
+          fi
+
+          # Get or create private subnet 1
+          SUBNET_PRIVATE_1=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" "Name=cidr-block,Values=10.0.3.0/24" --query 'Subnets[0].SubnetId' --output text || echo "")
+          if [ -z "$SUBNET_PRIVATE_1" ] || [ "$SUBNET_PRIVATE_1" == "None" ]; then
+            SUBNET_PRIVATE_1=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.3.0/24 --availability-zone ${AWS_REGION}a --query 'Subnet.SubnetId' --output text)
+            aws ec2 create-tags --resources $SUBNET_PRIVATE_1 --tags Key=Name,Value=wordpress-private-subnet-1
+          fi
+
+          # Get or create private subnet 2
+          SUBNET_PRIVATE_2=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" "Name=cidr-block,Values=10.0.4.0/24" --query 'Subnets[0].SubnetId' --output text || echo "")
+          if [ -z "$SUBNET_PRIVATE_2" ] || [ "$SUBNET_PRIVATE_2" == "None" ]; then
+            SUBNET_PRIVATE_2=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.4.0/24 --availability-zone ${AWS_REGION}b --query 'Subnet.SubnetId' --output text)
+            aws ec2 create-tags --resources $SUBNET_PRIVATE_2 --tags Key=Name,Value=wordpress-private-subnet-2
+          fi
+
+          # Create Internet Gateway if not exists
+          IGW_ID=$(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VPC_ID" --query 'InternetGateways[0].InternetGatewayId' --output text || echo "")
+          if [ -z "$IGW_ID" ] || [ "$IGW_ID" == "None" ]; then
+            IGW_ID=$(aws ec2 create-internet-gateway --query 'InternetGateway.InternetGatewayId' --output text)
+            aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+          fi
+
+          # Create or get the public routes table
+          RTB_PUBLIC_ID=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=wordpress-public-route-table" --query 'RouteTables[0].RouteTableId' --output text || echo "")
+          if [ -z "$RTB_PUBLIC_ID" ] || [ "$RTB_PUBLIC_ID" == "None" ]; then
+            RTB_PUBLIC_ID=$(aws ec2 create-route-table --vpc-id $VPC_ID --query 'RouteTable.RouteTableId' --output text)
+            aws ec2 create-tags --resources $RTB_PUBLIC_ID --tags Key=Name,Value=wordpress-public-route-table
+            aws ec2 create-route --route-table-id $RTB_PUBLIC_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+          fi
+
+          # Associete the public subnets routes table
+          aws ec2 associate-route-table --route-table-id $RTB_PUBLIC_ID --subnet-id $SUBNET_PUBLIC_1 || echo "Route table already associated with $SUBNET_PUBLIC_1"
+          aws ec2 associate-route-table --route-table-id $RTB_PUBLIC_ID --subnet-id $SUBNET_PUBLIC_2 || echo "Route table already associated with $SUBNET_PUBLIC_2"
+
+          # Enable auto assignment of public IPs in public subnets 
+          aws ec2 modify-subnet-attribute --subnet-id $SUBNET_PUBLIC_1 --map-public-ip-on-launch
+          aws ec2 modify-subnet-attribute --subnet-id $SUBNET_PUBLIC_2 --map-public-ip-on-launch
+
+          # Storage subnets IDs
+          echo "SUBNET_PUBLICS=$SUBNET_PUBLIC_1,$SUBNET_PUBLIC_2" >> $GITHUB_ENV
+          echo "SUBNET_PRIVATES=$SUBNET_PRIVATE_1,$SUBNET_PRIVATE_2" >> $GITHUB_ENV
+
+          echo "SUBNET_PUBLICS are $SUBNET_PUBLIC_1 and $SUBNET_PUBLIC_2"
+          echo "SUBNET_PRIVATES are $SUBNET_PRIVATE_1 and $SUBNET_PRIVATE_2"
+
+      - name: Create security group for ECS and EFS
+        run: |
+          set -e
+          set -x
+          echo "VPC_ID is $VPC_ID"
+
+          # Verificar si el grupo de seguridad ya existe
+          SG_ECS_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=wordpress-ecs-sg" "Name=vpc-id,Values=$VPC_ID" --query 'SecurityGroups[0].GroupId' --output text || echo "")
+          if [ -z "$SG_ECS_ID" ] || [ "$SG_ECS_ID" == "None" ]; then
+            # Crear grupo de seguridad para ECS y EFS
+            SG_ECS_ID=$(aws ec2 create-security-group --group-name wordpress-ecs-sg --description "Security group for ECS tasks and EFS" --vpc-id $VPC_ID --query 'GroupId' --output text)
+            echo "Created security group SG_ECS_ID: $SG_ECS_ID"
+
+            # Autorizar reglas de ingreso
+            aws ec2 authorize-security-group-ingress --group-id $SG_ECS_ID --protocol tcp --port 80 --cidr 0.0.0.0/0 || echo "Ingress rule on port 80 already exists."
+            aws ec2 authorize-security-group-ingress --group-id $SG_ECS_ID --protocol tcp --port 2049 --source-group $SG_ECS_ID || echo "Ingress rule for EFS already exists."
+          else
+            echo "Using existing security group SG_ECS_ID: $SG_ECS_ID"
+          fi
+
+          echo "SG_ECS_ID is $SG_ECS_ID"
+          echo "SG_ECS_ID=$SG_ECS_ID" >> $GITHUB_ENV
+
+
+      - name: Create security group for RDS
+        run: |
+          set -e
+          set -x
+          echo "VPC_ID is $VPC_ID"
+          echo "SG_ECS_ID is $SG_ECS_ID"
+
+          # Verificar si el grupo de seguridad ya existe
+          SG_RDS_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=wordpress-rds-sg" "Name=vpc-id,Values=$VPC_ID" --query 'SecurityGroups[0].GroupId' --output text || echo "")
+          if [ -z "$SG_RDS_ID" ] || [ "$SG_RDS_ID" == "None" ]; then
+            # Crear grupo de seguridad para RDS
+            SG_RDS_ID=$(aws ec2 create-security-group --group-name wordpress-rds-sg --description "Security group for RDS" --vpc-id $VPC_ID --query 'GroupId' --output text)
+            echo "Created security group SG_RDS_ID: $SG_RDS_ID"
+
+            # Autorizar reglas de ingreso desde el grupo de seguridad de ECS
+            aws ec2 authorize-security-group-ingress \
+              --group-id $SG_RDS_ID \
+              --protocol tcp \
+              --port 3306 \
+              --source-group $SG_ECS_ID \
+              || echo "Ingress rule from SG_ECS_ID to SG_RDS_ID on port 3306 already exists."
+          else
+            echo "Using existing security group SG_RDS_ID: $SG_RDS_ID"
+          fi
+
+          echo "SG_RDS_ID is $SG_RDS_ID"
+          echo "SG_RDS_ID=$SG_RDS_ID" >> $GITHUB_ENV
+
+      - name: Create RDS subnet group
+        run: |
+          set -e
+          set -x
+          echo "SUBNET_PRIVATES are $SUBNET_PRIVATES"
+
+          aws rds create-db-subnet-group \
+            --db-subnet-group-name wordpress-db-subnet-group \
+            --db-subnet-group-description "Subnet group for RDS" \
+            --subnet-ids ${SUBNET_PRIVATES//,/ } \
+            || echo "DB Subnet Group already exists."
+
+      - name: Create RDS database if not exists
+        run: |
+          set -e
+          set -x
+          aws rds describe-db-instances --db-instance-identifier $DB_INSTANCE_IDENTIFIER || \
+          aws rds create-db-instance \
+            --db-instance-identifier $DB_INSTANCE_IDENTIFIER \
+            --db-instance-class db.t3.micro \
+            --engine mysql \
+            --master-username $DB_USERNAME \
+            --master-user-password $DB_PASSWORD \
+            --allocated-storage 20 \
+            --db-name $DB_NAME \
+            --vpc-security-group-ids $SG_RDS_ID \
+            --db-subnet-group-name wordpress-db-subnet-group \
+            --no-publicly-accessible \
+            --backup-retention-period 7 \
+            --copy-tags-to-snapshot
+          # Esperar a que la instancia de la base de datos esté disponible
+          aws rds wait db-instance-available --db-instance-identifier $DB_INSTANCE_IDENTIFIER
+
+
+      - name: Get RDS endpoint
+        run: |
+          DB_ENDPOINT=$(aws rds describe-db-instances --db-instance-identifier $DB_INSTANCE_IDENTIFIER --query 'DBInstances[0].Endpoint.Address' --output text)
+          echo "DB_ENDPOINT=$DB_ENDPOINT" >> $GITHUB_ENV
+          echo "DB_ENDPOINT is $DB_ENDPOINT"
+
+      - name: Create EFS file system if not exists
+        env:
+          EFS_NAME: ${{ env.ECS_CLUSTER_NAME }}-efs
+          SG_ECS_ID: ${{ env.SG_ECS_ID }}
+          SUBNET_PRIVATES: ${{ env.SUBNET_PRIVATES }}
+        run: |
+          set -e
+          set -x
+          echo "EFS_NAME is $EFS_NAME"
+          echo "SG_ECS_ID is $SG_ECS_ID"
+          echo "SUBNET_PRIVATES are $SUBNET_PRIVATES"
+
+          FILE_SYSTEM_ID=$(aws efs describe-file-systems --creation-token $EFS_NAME --query 'FileSystems[0].FileSystemId' --output text || echo "")
+          if [ -z "$FILE_SYSTEM_ID" ] || [ "$FILE_SYSTEM_ID" == "None" ]; then
+            FILE_SYSTEM_ID=$(aws efs create-file-system --creation-token $EFS_NAME --performance-mode generalPurpose --throughput-mode bursting --encrypted --tags Key=Name,Value=$EFS_NAME --query 'FileSystemId' --output text)
+            # Esperar a que el sistema de archivos esté disponible
+            aws efs wait file-system-available --file-system-id $FILE_SYSTEM_ID
+          fi
+          echo "EFS_ID is $FILE_SYSTEM_ID"
+          echo "EFS_ID=$FILE_SYSTEM_ID" >> $GITHUB_ENV
+
+          # Crear puntos de montaje en subredes privadas
+          for SUBNET_ID in ${SUBNET_PRIVATES//,/ }; do
+            echo "Creating mount target in $SUBNET_ID"
+            aws efs create-mount-target --file-system-id $FILE_SYSTEM_ID --subnet-id $SUBNET_ID --security-groups $SG_ECS_ID || echo "Mount target in $SUBNET_ID already exists."
+          done
+
+      - name: Install envsubst
+        run: sudo apt-get update && sudo apt-get install -y gettext
+
+      - name: Register task definition
+        run: |
+          # Obtener el ID de la cuenta y la URI de ECR
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY_NAME
+
+          # Exportar variables para usarlas en envsubst
+          export ACCOUNT_ID
+          export ECS_SERVICE_NAME
+          export CONTAINER_NAME
+          export ECR_URI
+          export IMAGE_TAG
+          export DB_ENDPOINT
+          export DB_USERNAME
+          export DB_PASSWORD
+          export DB_NAME
+          export EFS_ID
+
+          # Reemplazar los marcadores de posición en task-def.json
+          envsubst < task-def.json > task-def-rendered.json
+
+          # Registrar la definición de la tarea
+          aws ecs register-task-definition --cli-input-json file://task-def-rendered.json
+
+      - name: Create or update ECS service
+        env:
+          ECS_CLUSTER_NAME: ${{ env.ECS_CLUSTER_NAME }}
+          ECS_SERVICE_NAME: ${{ env.ECS_SERVICE_NAME }}
+          SUBNET_PUBLICS: ${{ env.SUBNET_PUBLICS }}
+          SG_ECS_ID: ${{ env.SG_ECS_ID }}
+        run: |
+          set -e
+          set -x
+          echo "SUBNET_PUBLICS are $SUBNET_PUBLICS"
+          echo "SG_ECS_ID is $SG_ECS_ID"
+
+          # Verificar si el servicio ya existe
+          SERVICE_STATUS=$(aws ecs describe-services --cluster $ECS_CLUSTER_NAME --services $ECS_SERVICE_NAME --query 'services[0].status' --output text || echo "MISSING")
+
+          # Convertir SUBNET_PUBLICS a un arreglo JSON
+          SUBNET_PUBLICS_JSON=$(echo $SUBNET_PUBLICS | awk -v q='"' 'BEGIN{FS=","; OFS=","} {for(i=1;i<=NF;i++) $i=q $i q}1' | sed 's/.*/[&]/')
+          echo "SUBNET_PUBLICS_JSON is $SUBNET_PUBLICS_JSON"
+
+          # Formatear SG_ECS_ID como un arreglo JSON
+          SG_ECS_ID_JSON="[\"$SG_ECS_ID\"]"
+          echo "SG_ECS_ID_JSON is $SG_ECS_ID_JSON"
+
+          if [ "$SERVICE_STATUS" = "ACTIVE" ]; then
+            aws ecs update-service --cluster $ECS_CLUSTER_NAME --service $ECS_SERVICE_NAME --task-definition $ECS_SERVICE_NAME-task
+          else
+            aws ecs create-service \
+              --cluster $ECS_CLUSTER_NAME \
+              --service-name $ECS_SERVICE_NAME \
+              --task-definition $ECS_SERVICE_NAME-task \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=$SUBNET_PUBLICS_JSON,securityGroups=$SG_ECS_ID_JSON,assignPublicIp=ENABLED}"
+          fi

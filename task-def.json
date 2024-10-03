@@ -1,0 +1,58 @@
+{
+  "family": "${ECS_SERVICE_NAME}-task",
+  "networkMode": "awsvpc",
+  "executionRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "${CONTAINER_NAME}",
+      "image": "${ECR_URI}:${IMAGE_TAG}",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 80,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "WORDPRESS_DB_HOST",
+          "value": "${DB_ENDPOINT}"
+        },
+        {
+          "name": "WORDPRESS_DB_USER",
+          "value": "${DB_USERNAME}"
+        },
+        {
+          "name": "WORDPRESS_DB_PASSWORD",
+          "value": "${DB_PASSWORD}"
+        },
+        {
+          "name": "WORDPRESS_DB_NAME",
+          "value": "${DB_NAME}"
+        }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "wordpress-efs",
+          "containerPath": "/var/www/html/wp-content",
+          "readOnly": false
+        }
+      ]
+    }
+  ],
+  "volumes": [
+    {
+      "name": "wordpress-efs",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "${EFS_ID}",
+        "transitEncryption": "ENABLED"
+      }
+    }
+  ],
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "cpu": "1024",
+  "memory": "2048"
+}
