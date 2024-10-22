@@ -37,12 +37,11 @@ EXPOSE 80
 
 # Configuración de PHP para aumentar el tamaño máximo de subida a 2.4GB (necesario para backup)
 # Configuración de PHP para aumentar el tamaño máximo de subida y tiempos de ejecución
-RUN echo "upload_max_filesize = 5000M" > /usr/local/etc/php/conf.d/uploads.ini && \
-    echo "post_max_size = 5000M" >> /usr/local/etc/php/conf.d/uploads.ini && \
-    echo "memory_limit = 5000M" >> /usr/local/etc/php/conf.d/uploads.ini && \
+RUN echo "upload_max_filesize = 5100M" > /usr/local/etc/php/conf.d/uploads.ini && \
+    echo "post_max_size = 5100M" >> /usr/local/etc/php/conf.d/uploads.ini && \
+    echo "memory_limit = 5100M" >> /usr/local/etc/php/conf.d/uploads.ini && \
     echo "max_execution_time = 0" >> /usr/local/etc/php/conf.d/uploads.ini && \
     echo "max_input_time = -1" >> /usr/local/etc/php/conf.d/uploads.ini && \
-    echo "track_errors = 1" >> /usr/local/etc/php/conf.d/uploads.ini && \
     echo "display_errors = On" >> /usr/local/etc/php/conf.d/uploads.ini
 
 # COPY ./config-files/* /path/in/container/
