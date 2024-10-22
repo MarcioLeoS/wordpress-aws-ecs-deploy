@@ -42,6 +42,7 @@ RUN echo "upload_max_filesize = 5000M" > /usr/local/etc/php/conf.d/uploads.ini &
     echo "memory_limit = 5000M" >> /usr/local/etc/php/conf.d/uploads.ini && \
     echo "max_execution_time = 0" >> /usr/local/etc/php/conf.d/uploads.ini && \
     echo "max_input_time = -1" >> /usr/local/etc/php/conf.d/uploads.ini && \
-    echo "display_errors = Off" >> /usr/local/etc/php/conf.d/uploads.ini
+    echo "track_errors = 1" >> /usr/local/etc/php/conf.d/uploads.ini && \
+    echo "display_errors = On" >> /usr/local/etc/php/conf.d/uploads.ini
 
 # COPY ./config-files/* /path/in/container/
