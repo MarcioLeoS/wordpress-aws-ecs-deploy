@@ -38,7 +38,17 @@
           "containerPath": "/var/www/html/wp-content",
           "readOnly": false
         }
-      ]
+      ],
+      "cpu": 2048,
+      "memory": 4096,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/${ECS_SERVICE_NAME}",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "${CONTAINER_NAME}"
+        }
+      }
     }
   ],
   "volumes": [
@@ -53,6 +63,6 @@
   "requiresCompatibilities": [
     "FARGATE"
   ],
-  "cpu": "1024",
-  "memory": "2048"
+  "cpu": "4096",
+  "memory": "8192"
 }
