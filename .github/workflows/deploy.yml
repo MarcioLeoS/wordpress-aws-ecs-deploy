@@ -20,6 +20,8 @@ env:
   BACKUP_VAULT_NAME: wordpress-backup-vault
   S3_BUCKET_NAME: osole-proyectoxyz-backups
   DATASYNC_TASK_NAME: efs-to-s3-backup-task
+  DOMAIN_NAME: purastone.osole-dev.com.ar
+  ACM_CERTIFICATE_ARN: ''
 
 jobs:
   deploy:
@@ -428,6 +430,26 @@ jobs:
           echo "Creating CloudWatch Log Group: $LOG_GROUP_NAME"
           aws logs create-log-group --log-group-name $LOG_GROUP_NAME || echo "Log group $LOG_GROUP_NAME already exists."
 
+      - name: Request or Import SSL Certificate
+        run: |
+          DOMAIN_NAME="${{ env.DOMAIN_NAME }}"
+          CERTIFICATE_ARN=$(aws acm list-certificates --query "CertificateSummaryList[?DomainName=='$DOMAIN_NAME'].CertificateArn" --output text || echo "")
+          if [ -z "$CERTIFICATE_ARN" ] || [ "$CERTIFICATE_ARN" == "None" ]; then
+            CERTIFICATE_ARN=$(aws acm request-certificate --domain-name $DOMAIN_NAME --validation-method DNS --query 'CertificateArn' --output text)
+            echo "Certificate requested with ARN: $CERTIFICATE_ARN"
+            # Si usas Route 53, puedes automatizar la validación agregando registros DNS aquí
+          else
+            echo "Certificate already exists with ARN: $CERTIFICATE_ARN"
+          fi
+          echo "ACM_CERTIFICATE_ARN=$CERTIFICATE_ARN" >> $GITHUB_ENV
+
+      - name: Update Security Group for HTTPS
+        run: |
+          # Permitir tráfico entrante en el puerto 443
+          aws ec2 authorize-security-group-ingress --group-id $SG_ECS_ID --protocol tcp --port 443 --cidr 0.0.0.0/0 || echo "Ingress rule on port 443 already exists."
+
+
+
       - name: Create Application Load Balancer
         env:
             SUBNET_PUBLIC_1: ${{ env.SUBNET_PUBLIC_1 }}
@@ -537,6 +559,52 @@ jobs:
               --default-actions Type=redirect,RedirectConfig="{Protocol=HTTPS,Port='443',StatusCode=HTTP_301}"
             echo "Updated HTTP Listener to redirect to HTTPS"
           fi
+
+      - name: Create HTTPS Listener on ALB
+        env:
+          ALB_ARN: ${{ env.ALB_ARN }}
+          TARGET_GROUP_ARN: ${{ env.TARGET_GROUP_ARN }}
+          ACM_CERTIFICATE_ARN: ${{ env.ACM_CERTIFICATE_ARN }}
+        run: |
+          set -e
+          set -x
+          echo "ALB_ARN is $ALB_ARN"
+          echo "TARGET_GROUP_ARN is $TARGET_GROUP_ARN"
+          echo "ACM_CERTIFICATE_ARN is $ACM_CERTIFICATE_ARN"
+      
+          # Check if the HTTPS listener already exists
+          HTTPS_LISTENER_ARN=$(aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN --query 'Listeners[?Port==`443`].ListenerArn' --output text || echo "")
+          if [ -z "$HTTPS_LISTENER_ARN" ] || [ "$HTTPS_LISTENER_ARN" == "None" ]; then
+            # Create the HTTPS listener
+            HTTPS_LISTENER_ARN=$(aws elbv2 create-listener \
+              --load-balancer-arn $ALB_ARN \
+              --protocol HTTPS \
+              --port 443 \
+              --certificates CertificateArn=$ACM_CERTIFICATE_ARN \
+              --default-actions Type=forward,TargetGroupArn=$TARGET_GROUP_ARN \
+              --query 'Listeners[0].ListenerArn' --output text)
+            echo "Created HTTPS Listener with ARN: $HTTPS_LISTENER_ARN"
+          else
+            echo "HTTPS Listener already exists with ARN: $HTTPS_LISTENER_ARN"
+          fi
+          echo "HTTPS_LISTENER_ARN=$HTTPS_LISTENER_ARN" >> $GITHUB_ENV
+
+      - name: Configure HTTP to HTTPS Redirection
+        env:
+          ALB_ARN: ${{ env.ALB_ARN }}
+          LISTENER_ARN: ${{ env.LISTENER_ARN }}
+        run: |
+          set -e
+          set -x
+          echo "ALB_ARN is $ALB_ARN"
+          echo "LISTENER_ARN is $LISTENER_ARN"
+      
+          # Update the HTTP listener to redirect to HTTPS
+          aws elbv2 modify-listener \
+            --listener-arn $LISTENER_ARN \
+            --default-actions Type=redirect,RedirectConfig='{"Protocol":"HTTPS","Port":"443","StatusCode":"HTTP_301"}' || echo "HTTP listener already configured for redirection."
+
+
 
       - name: Create or update ECS service
         env:
@@ -759,11 +827,3 @@ jobs:
           fi
           
           echo "BACKUP_SELECTION_ID=$BACKUP_SELECTION_ID" >> $GITHUB_ENV
-            
-
-            
-
-            
-
-            
-
